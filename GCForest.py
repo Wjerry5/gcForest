@@ -351,6 +351,9 @@ class gcForest(object):
             self.n_layer += 1
             prf_crf_pred_layer = self._cascade_layer(feat_arr, y_train)
             accuracy_layer = self._cascade_evaluation(X_test, y_test)
+            
+            if accuracy_layer <= (accuracy_ref + tol):
+                self.n_layer -= 1
 
             while accuracy_layer > (accuracy_ref + tol) and self.n_layer <= max_layers:
                 accuracy_ref = accuracy_layer
