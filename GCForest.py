@@ -1,29 +1,21 @@
-#!usr/bin/env python
-"""
-Version : 0.1.4
-Date : 15th April 2017
+#!usr/bin/python
+#
 
-Author : Pierre-Yves Lablanche
-Email : plablanche@aims.ac.za
-Affiliation : African Institute for Mathematical Sciences - South Africa
-              Stellenbosch University - South Africa
 
-License : MIT
+# log
+# add GBDT for binary classfication
+# todo: 1.use multi classfication, instead of binary.
+#
 
-Status : Under Development
 
-Description :
-Python3 implementation of the gcForest algorithm preesented in Zhou and Feng 2017
-(paper can be found here : https://arxiv.org/abs/1702.08835 ).
-It uses the typical scikit-learn syntax  with a .fit() function for training
-and a .predict() function for predictions.
 
-"""
 import itertools
 import numpy as np
+from numpy.lib.stride_tricks import as_strided
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score,auc,roc_curve
+import xgboost as xgb
 
 __author__ = "Pierre-Yves Lablanche"
 __email__ = "plablanche@aims.ac.za"
@@ -37,7 +29,8 @@ class gcForest(object):
 
     def __init__(self, shape_1X=None, n_mgsRFtree=30, window=None, stride=1,
                  cascade_test_size=0.2, n_cascadeRF=2, n_cascadeRFtree=101, cascade_layer=np.inf,
-                 min_samples_mgs=0.1, min_samples_cascade=0.05, tolerance=0.0, n_jobs=1):
+                 min_samples_mgs=0.1, min_samples_cascade=0.05, tolerance=0.0, n_jobs=1,
+                 prf_flag=True,crf_flag=True,xgf_flag=True,eval_metric='acc'):
         """ gcForest Classifier.
 
         :param shape_1X: int or tuple list or np.array (default=None)
@@ -107,6 +100,10 @@ class gcForest(object):
         setattr(self, 'min_samples_cascade', min_samples_cascade)
         setattr(self, 'tolerance', tolerance)
         setattr(self, 'n_jobs', n_jobs)
+        setattr(self, 'prf_flag', prf_flag)
+        setattr(self, 'crf_flag', crf_flag)
+        setattr(self, 'xgf_flag', xgf_flag)
+        setattr(self, 'eval_metric', eval_metric)
 
     def fit(self, X, y):
         """ Training the gcForest on input data X and associated target y.
@@ -335,7 +332,7 @@ class gcForest(object):
         :return: np.array
             1D array containing the predicted class for each input sample.
         """
-        if y is not None:
+        if y is not None:# for training the model ,no need to modify
             setattr(self, 'n_layer', 0)
             test_size = getattr(self, 'cascade_test_size')
             max_layers = getattr(self, 'cascade_layer')
@@ -348,10 +345,12 @@ class gcForest(object):
             accuracy_ref = self._cascade_evaluation(X_test, y_test)
             feat_arr = self._create_feat_arr(X_train, prf_crf_pred_ref)
 
+            # this is a bug, what if I just stop training after the first layer?
             self.n_layer += 1
             prf_crf_pred_layer = self._cascade_layer(feat_arr, y_train)
             accuracy_layer = self._cascade_evaluation(X_test, y_test)
-            
+
+            # this is to fix the bug
             if accuracy_layer <= (accuracy_ref + tol):
                 self.n_layer -= 1
 
@@ -365,10 +364,10 @@ class gcForest(object):
 
         elif y is None:
             at_layer = 1
-            prf_crf_pred_ref = self._cascade_layer(X, layer=at_layer)
+            prf_crf_pred_ref = self._cascade_layer(X, layer=at_layer)# first layer just use X for training
             while at_layer < getattr(self, 'n_layer'):
                 at_layer += 1
-                feat_arr = self._create_feat_arr(X, prf_crf_pred_ref)
+                feat_arr = self._create_feat_arr(X, prf_crf_pred_ref) # later layers use X and early results for training
                 prf_crf_pred_ref = self._cascade_layer(feat_arr, layer=at_layer)
 
         return prf_crf_pred_ref
@@ -395,27 +394,71 @@ class gcForest(object):
         min_samples = getattr(self, 'min_samples_cascade')
 
         n_jobs = getattr(self, 'n_jobs')
+
+        prf_flag = getattr(self, 'prf_flag')
+        crf_flag = getattr(self, 'crf_flag')
+        xgf_flag = getattr(self, 'xgf_flag')
+
+
         prf = RandomForestClassifier(n_estimators=n_tree, max_features='sqrt',
                                      min_samples_split=min_samples, oob_score=True, n_jobs=n_jobs)
         crf = RandomForestClassifier(n_estimators=n_tree, max_features=None,
                                      min_samples_split=min_samples, oob_score=True, n_jobs=n_jobs)
 
         prf_crf_pred = []
-        if y is not None:
+        if y is not None:#training
             print('Adding/Training Layer, n_layer={}'.format(self.n_layer))
             for irf in range(n_cascadeRF):
-                prf.fit(X, y)
-                crf.fit(X, y)
-                setattr(self, '_casprf{}_{}'.format(self.n_layer, irf), prf)
-                setattr(self, '_cascrf{}_{}'.format(self.n_layer, irf), crf)
-                prf_crf_pred.append(prf.oob_decision_function_)
-                prf_crf_pred.append(crf.oob_decision_function_)
+                # print X
+                # print X.shape
+
+                if prf_flag:
+                    prf.fit(X, y)
+                    setattr(self, '_casprf{}_{}'.format(self.n_layer, irf), prf)
+                    prf_crf_pred.append(prf.oob_decision_function_)
+                    print('complete prf in  n_layer={}'.format(self.n_layer))
+
+                if crf_flag:
+                    crf.fit(X, y)
+                    setattr(self, '_cascrf{}_{}'.format(self.n_layer, irf), crf)
+                    prf_crf_pred.append(crf.oob_decision_function_)
+                    print('complete crf in  n_layer={}'.format(self.n_layer))
+
+                if xgf_flag:
+                    param={'early_stopping_rounds': 2,
+                                     # 'subsample': 0.6,
+                                     'eta': 0.05,
+                                     # 'gamma': 1,
+                                     'min_child_weight': 1,
+                                     'max_depth': 12,
+                                     'silent': 1,
+                                     'eval_metric': 'auc',
+                                     # 'learning_rate':0.1,
+                                     'objective': 'binary:logistic'}
+                    dtrain = xgb.DMatrix(X, label=y)
+                    xgf = xgb.train(param, dtrain, n_tree)
+                    xgf_y = xgf.predict(dtrain)
+                    setattr(self, '_casxgf{}_{}'.format(self.n_layer, irf), xgf)
+                    prf_crf_pred.append(np.concatenate((1 - np.array([xgf_y]).T, np.array([xgf_y]).T), axis=1))  # get the out put
+                    print('complete xgf in  n_layer={}'.format(self.n_layer))
+
         elif y is None:
             for irf in range(n_cascadeRF):
-                prf = getattr(self, '_casprf{}_{}'.format(layer, irf))
-                crf = getattr(self, '_cascrf{}_{}'.format(layer, irf))
-                prf_crf_pred.append(prf.predict_proba(X))
-                prf_crf_pred.append(crf.predict_proba(X))
+                if prf_flag:
+                    prf = getattr(self, '_casprf{}_{}'.format(layer, irf))
+                    prf_crf_pred.append(prf.predict_proba(X))
+
+                if crf_flag:
+                    crf = getattr(self, '_cascrf{}_{}'.format(layer, irf))
+                    prf_crf_pred.append(crf.predict_proba(X))
+
+
+                if xgf_flag:
+                    xgf = getattr(self, '_casxgf{}_{}'.format(layer, irf))
+                    d_test=xgb.DMatrix(X)
+                    xgf_y = xgf.predict(d_test)
+                    prf_crf_pred.append(np.concatenate((1 - np.array([xgf_y]).T, np.array([xgf_y]).T), axis=1))
+
 
         return prf_crf_pred
 
@@ -432,10 +475,21 @@ class gcForest(object):
         :return: float
             the cascade accuracy.
         """
-        casc_pred_prob = np.mean(self.cascade_forest(X_test), axis=0)
-        casc_pred = np.argmax(casc_pred_prob, axis=1)
-        casc_accuracy = accuracy_score(y_true=y_test, y_pred=casc_pred)
-        print('Layer validation accuracy = {}'.format(casc_accuracy))
+        eval_metric = getattr(self, 'eval_metric')
+
+        if eval_metric=='acc':
+            casc_pred_prob = np.mean(self.cascade_forest(X_test), axis=0)
+            casc_pred = np.argmax(casc_pred_prob, axis=1)
+            casc_accuracy = accuracy_score(y_true=y_test, y_pred=casc_pred)
+            print('Layer validation accuracy = {}'.format(casc_accuracy))
+        elif eval_metric=='auc':
+            tmp = np.mean(self.cascade_forest(X_test), axis=0)
+            casc_pred_prob = tmp[:, 1]
+            # casc_pred = np.argmax(casc_pred_prob, axis=1)
+            # casc_accuracy = accuracy_score(y_true=y_test, y_pred=casc_pred)
+            fpr, tpr, thresholds = roc_curve(y_test, casc_pred_prob, pos_label=1)
+            casc_accuracy = auc(fpr, tpr)
+            print('Layer validation auc = {}'.format(casc_accuracy))
 
         return casc_accuracy
 
@@ -459,3 +513,4 @@ class gcForest(object):
         feat_arr = np.concatenate([add_feat, X], axis=1)
 
         return feat_arr
+
